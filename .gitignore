@@ -127,3 +127,18 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+.idea
+
+datasets/
+
+tmp/
+citations/
+
+fincen/
+
+fraud-detection/
+
+recommendation/
+
+checkpoint.pt
