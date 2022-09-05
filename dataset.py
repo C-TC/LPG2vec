@@ -1,13 +1,19 @@
 from typing import Union, List, Tuple
 
 import torch
+from torch import Tensor
 from torch_geometric.data import Data, Dataset, InMemoryDataset
 import os
-from torch_geometric.utils import coalesce, remove_self_loops
+from torch_geometric.utils import coalesce, remove_self_loops, stochastic_blockmodel_graph
 from util import train_test_split
+from typing import Callable, List, Optional, Union
+import numpy as np
 
 
 class LPGdataset(Dataset):
+    """
+    Returns a LPG dataset in the PYG format.
+    """
     def __init__(self, root, transform=None, pre_transform=None, use_v_label=True, use_v_property=True,
                  use_v_str_property=True, use_e_label=True, use_e_property=True, use_e_str_property=True):
         # self.raw_dir = os.path.join(root,'raw')
@@ -99,8 +105,6 @@ class LPGdataset(Dataset):
             f"vertices:{num_vertex}, edges:{num_edge}, v_label_dim:{v_label.shape[1]}, e_label_dim:{e_label.shape[1]},"
             f" v_prop_dim:{x.shape[1] - v_label.shape[1]}, e_prop_dim:{edge_attr.shape[1] - e_label.shape[1]}")
 
-        #train_mask = torch.load(os.path.join(self.raw_dir, 'train_mask.pt'))
-        #test_mask = torch.load(os.path.join(self.raw_dir, 'test_mask.pt'))
         train_mask, test_mask = train_test_split(x.shape[0], 0.7)
 
         data = Data(x=x.float(), edge_index=edge_index.long(), edge_attr=edge_attr.float(), y=target.long(),
@@ -135,6 +139,9 @@ def get_edge_index(num_src_nodes, num_dst_nodes, avg_degree):
 
 
 class ArtificialDataset(InMemoryDataset):
+    """
+    The artificial dataset that mimics PYG FakeDataset.
+    """
     def __init__(self, num_nodes=1000, avg_degree=10, num_classes=10,
                  num_v_label=20, num_v_property=200, num_e_label=5, num_e_property=50,
                  label_prob=0.3, property_prob=0.6, fuse_y_to_x=True, fuse_y_to_edge_attr=True):
@@ -187,16 +194,100 @@ class ArtificialDataset(InMemoryDataset):
         return data
 
 
+class StochasticBlockModelDataset(InMemoryDataset):
+    """
+    Artificial Dataset similar to PYG StochasticBlockModelDataset.
+    """
+    def __init__(
+            self,
+            block_sizes: Union[List[int], Tensor],
+            edge_probs: Union[List[List[float]], Tensor],
+            num_channels: Optional[int] = None,
+            is_undirected: bool = True,
+            n_informative=2,
+            n_redundant=0,
+            n_repeated=0,
+            flip_target=0,
+            **kwargs,
+    ):
+        super().__init__('.')
+        if not isinstance(block_sizes, torch.Tensor):
+            block_sizes = torch.tensor(block_sizes, dtype=torch.long)
+        if not isinstance(edge_probs, torch.Tensor):
+            edge_probs = torch.tensor(edge_probs, dtype=torch.float)
+
+        self.block_sizes = block_sizes
+        self.edge_probs = edge_probs
+        self.num_channels = num_channels
+        self.is_undirected = is_undirected
+        self.flip_target = flip_target
+
+        self.kwargs = {
+            'n_informative': n_informative,
+            'n_redundant': n_redundant,
+            'n_repeated': n_repeated,
+            'flip_y': 0.0,
+            'shuffle': False,
+        }
+        self.kwargs.update(kwargs)
+
+        data_list = [self.generate_data()]
+        self.data, self.slices = self.collate(data_list)
+
+    def generate_data(self):
+        from sklearn.datasets import make_classification
+
+        edge_index = stochastic_blockmodel_graph(
+            self.block_sizes, self.edge_probs, directed=not self.is_undirected)
+
+        num_samples = int(self.block_sizes.sum())
+        num_classes = self.block_sizes.size(0)
+
+        x = None
+        if self.num_channels is not None:
+            x, _ = make_classification(
+                n_samples=num_samples,
+                n_features=self.num_channels,
+                n_classes=num_classes,
+                weights=self.block_sizes / num_samples,
+                **self.kwargs,
+            )
+            x = torch.from_numpy(x).to(torch.float)
+        y = torch.arange(num_classes).repeat_interleave(self.block_sizes)
+        train_mask, test_mask = train_test_split(num_samples, 0.7)
+
+        if self.flip_target > 0:
+            flip_mask = torch.rand(num_samples) < self.flip_target
+            y[flip_mask] = torch.randint(num_classes, size=(torch.sum(flip_mask).item(),))
+
+        data = Data(x=x, edge_index=edge_index, y=y, train_mask=train_mask, test_mask=test_mask)
+
+        return data
+
+
+class TempDataset(InMemoryDataset):
+    """
+    Utility dataset to generate new dataset using modified data. (Bypassing some restrictions in PYG.)
+    """
+    def __init__(self, oldData, new_X=None, new_edge_attr=None):
+        super().__init__('.')
+        self.oldData = oldData
+        self.new_X = new_X
+        self.new_edge_attr = new_edge_attr
+
+        data_list = [self.generate_data()]
+        self.data, self.slices = self.collate(data_list)
+
+    def generate_data(self):
+        data = Data(x=self.oldData.x.clone().detach() if self.new_X is None else self.new_X,
+                    edge_index=self.oldData.edge_index.clone().detach(),
+                    edge_attr=self.oldData.edge_attr.clone().detach() if self.new_edge_attr is None and self.oldData.edge_attr is not None else self.new_edge_attr,
+                    y=self.oldData.y, train_mask=self.oldData.train_mask, test_mask=self.oldData.test_mask)
+        return data
+
+
 def get_dataset_info():
     datasets_name = ["recommendation", "citations", "fraud-detection", "fincen"]
     for name in datasets_name:
         print(name)
         data = LPGdataset(os.path.join('.', name))
-
-
-if __name__ == '__main__':
-    # data = LPGdataset('./fincen', use_e_str_property=True, use_v_str_property=True)
-    data = ArtificialDataset()
-    data[0].train_mask = None
-    print(data)
-    # get_dataset_info()

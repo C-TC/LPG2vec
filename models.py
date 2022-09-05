@@ -16,14 +16,29 @@ from torch.nn.modules.loss import _Loss
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import TensorDataset
-
+from pytorchtools import EarlyStopping
 from dataset import LPGdataset
 
 
-class MyGATConv(MessagePassing):
-    def __init__(self, in_channels, out_channels, heads=1, encoded_mappings=None, concat=True, negative_slope=0.2,
-                 dropout=0.0,
-                 _add_self_loops=True, edge_dim=None, fill_value='mean', bias=True):
+class GAT_ATTLOC_CONV(MessagePassing):
+    """
+    Graph convolution layer based on GATConv and integrated with attention locator.
+    """
+    def __init__(self, in_channels, out_channels, v_mapping, heads=1, e_mapping=None, concat=True,
+                 negative_slope=0.2, dropout=0.0, edge_dim=None, bias=True, restrict_W=False):
+        """
+        :param in_channels:
+        :param out_channels:
+        :param v_mapping: vertex feature mapping matrix
+        :param heads: heads in attention mechanism
+        :param e_mapping: edge feature mapping matrix
+        :param concat: concatenate multi-head hidden embedding or averaging them.
+        :param negative_slope: slope of leaky relu
+        :param dropout: drop out probability
+        :param edge_dim: edge feature dimension
+        :param bias:
+        :param restrict_W: use restricted attention score function or not
+        """
         super().__init__(node_dim=0, aggr='add')
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -31,29 +46,27 @@ class MyGATConv(MessagePassing):
         self.concat = concat
         self.negative_slope = negative_slope
         self.dropout = dropout
-        self._add_self_loops = _add_self_loops
         self.edge_dim = edge_dim
-        self.fill_value = fill_value
-        self.encoded_mappings = encoded_mappings
+        self.v_encoded_mapping = v_mapping
+        self.e_encoded_mapping = e_mapping
 
-        # assume vertex mapping and edge mapping coexist
         self.lin_dst = self.lin_src = Linear(in_channels, heads * out_channels, bias=False, weight_initializer='glorot')
 
-        if self.encoded_mappings is None:
-            self.att_src = Parameter(torch.Tensor(1, heads, out_channels))
-            self.att_dst = Parameter(torch.Tensor(1, heads, out_channels))
-        else:
-            self.num_v_features = encoded_mappings[0].shape[0]
-            self.att_src = Parameter(torch.Tensor(1, self.num_v_features))
-            self.att_dst = Parameter(torch.Tensor(1, self.num_v_features))
+        self.num_v_features = v_mapping.shape[0]
+        self.att_src = Parameter(torch.Tensor(1, self.num_v_features))
+        self.att_dst = Parameter(torch.Tensor(1, self.num_v_features))
+
+        self.restrict_W = restrict_W
+        if self.restrict_W:
+            self.W_r = Parameter(torch.Tensor(self.num_v_features, v_mapping.shape[1]))
 
         if edge_dim is not None:
-            if self.encoded_mappings is None:
+            if self.e_encoded_mapping is None:
                 self.lin_edge = Linear(edge_dim, heads * out_channels, bias=False, weight_initializer='glorot')
                 self.att_edge = Parameter(torch.Tensor(1, heads, out_channels))
             else:
                 self.lin_edge = None
-                self.num_e_features = encoded_mappings[1].shape[0]
+                self.num_e_features = e_mapping.shape[0]
                 self.att_edge = Parameter(torch.Tensor(1, self.num_e_features))
         else:
             self.lin_edge = None
@@ -79,6 +92,8 @@ class MyGATConv(MessagePassing):
         glorot(self.att_dst)
         glorot(self.att_edge)
         zeros(self.bias)
+        if self.restrict_W:
+            glorot(self.W_r)
 
     def forward(self, x, edge_index, edge_attr=None, size=None):
         if edge_attr is None:
@@ -88,28 +103,16 @@ class MyGATConv(MessagePassing):
         x_src = x_dst = self.lin_src(x).view(-1, H, C)
         x_new = (x_src, x_dst)
 
-        if self.encoded_mappings is None:
-            alpha_src = (x_src * self.att_src).sum(dim=-1)
-            alpha_dst = (x_dst * self.att_dst).sum(dim=-1)
-            alpha = (alpha_src, alpha_dst)
+        if self.restrict_W:
+            alpha_src = (torch.mm(x, normalize(self.v_encoded_mapping.t() * torch.sigmoid(self.W_r).t(), dim=0)) * normalize(self.att_src)).sum(dim=-1)
+            alpha_dst = (torch.mm(x, normalize(self.v_encoded_mapping.t() * torch.sigmoid(self.W_r).t(), dim=0)) * normalize(self.att_dst)).sum(dim=-1)
         else:
-            alpha_src = (torch.mm(x, torch.transpose(self.encoded_mappings[0], 0, 1)) * self.att_src).sum(dim=-1)
-            alpha_dst = (torch.mm(x, torch.transpose(self.encoded_mappings[0], 0, 1)) * self.att_dst).sum(dim=-1)
-            alpha = (alpha_src, alpha_dst)
+            alpha_src = (torch.mm(x, torch.transpose(self.v_encoded_mapping, 0, 1)) * normalize(self.att_src)).sum(dim=-1)
+            alpha_dst = (torch.mm(x, torch.transpose(self.v_encoded_mapping, 0, 1)) * normalize(self.att_dst)).sum(dim=-1)
 
-        '''
-        if self._add_self_loops:
-            num_nodes = x_src.size(0)
-            if x_dst is not None:
-                num_nodes = min(num_nodes, x_dst.size(0))
-            num_nodes = min(size) if size is not None else num_nodes
-            edge_index, edge_attr = remove_self_loops(
-                edge_index, edge_attr)
-            edge_index, edge_attr = add_self_loops(edge_index, edge_attr, fill_value=self.fill_value,
-                                                   num_nodes=num_nodes)
-        '''
+        alpha = (alpha_src, alpha_dst)
 
-        out = self.propagate(edge_index, x=x_new, alpha=alpha, edge_attr=edge_attr, size=size)
+        out = x_src + self.propagate(edge_index, x=x_new, alpha=alpha, edge_attr=edge_attr, size=size)
 
         alpha = self._alpha
         assert alpha is not None
@@ -131,13 +134,13 @@ class MyGATConv(MessagePassing):
         if edge_attr is not None:
             if edge_attr.dim() == 1:
                 edge_attr = edge_attr.view(-1, 1)
-            if self.encoded_mappings is None:
+            if self.e_encoded_mapping is None:
                 edge_attr = self.lin_edge(edge_attr)
                 edge_attr = edge_attr.view(-1, self.heads, self.out_channels)
                 alpha_edge = (edge_attr * self.att_edge).sum(dim=-1)
                 alpha = alpha + alpha_edge
             else:
-                alpha_edge = (torch.mm(edge_attr, torch.transpose(self.encoded_mappings[1], 0, 1)) * self.att_edge).sum(
+                alpha_edge = (torch.mm(edge_attr, torch.transpose(self.e_encoded_mapping, 0, 1)) * self.att_edge).sum(
                     dim=-1)
                 alpha = alpha + alpha_edge
 
@@ -146,41 +149,49 @@ class MyGATConv(MessagePassing):
         self._alpha = alpha
         alpha = F.dropout(alpha, p=self.dropout, training=self.training)
 
-        if self.encoded_mappings is None:
-            return x_j * alpha.unsqueeze(-1)
-        else:
-            return x_j * alpha.view(-1, 1, 1)
+        return x_j * alpha.view(-1, 1, 1)
 
     def __repr__(self) -> str:
         return (f'{self.__class__.__name__}({self.in_channels}, '
                 f'{self.out_channels}, heads={self.heads})')
 
+    def get_att_vectors(self):
+        return self.att_src.data, self.att_dst.data
 
-class MyGAT(torch.nn.Module):
-    def __init__(self, data, encoded_mappings=None, use_edge_features=True):
-        super(MyGAT, self).__init__()
+
+class GAT_ATTLOC(torch.nn.Module):
+    """
+    Graph Neural Network integrated with attention locator.
+
+    sturcture:
+        first layer(conv1)      GATConv with attention locator
+
+        second layer(conv1)     GATConv
+    """
+    def __init__(self, data, v_mapping, e_mapping=None, use_edge_features=False, restrict_W=False):
+        super(GAT_ATTLOC, self).__init__()
         self.hid = 16
         self.in_head = 8
         self.out_head = 1
-        self.use_edge_features = True
+        self.use_edge_features = use_edge_features
 
-        if encoded_mappings is not None:
+        if e_mapping is not None:
             assert use_edge_features
 
         num_features = data.x.shape[1]
         num_classes = len(data.y.unique())
         if use_edge_features:
             edge_dim = data.edge_attr.shape[1]
-            if encoded_mappings is None:
-                self.conv1 = MyGATConv(num_features, self.hid, edge_dim=edge_dim, heads=self.in_head, dropout=0.6)
+            if e_mapping is None:
+                self.conv1 = GAT_ATTLOC_CONV(num_features, self.hid, v_mapping=v_mapping, edge_dim=edge_dim, heads=self.in_head, dropout=0.6, restrict_W=restrict_W)
             else:
-                self.conv1 = MyGATConv(num_features, self.hid, encoded_mappings=encoded_mappings, edge_dim=edge_dim,
-                                       heads=self.in_head, dropout=0.6)
-            self.conv2 = MyGATConv(self.hid * self.in_head, num_classes, edge_dim=edge_dim, concat=False,
+                self.conv1 = GAT_ATTLOC_CONV(num_features, self.hid, v_mapping=v_mapping, e_mapping=e_mapping, edge_dim=edge_dim,
+                                             heads=self.in_head, dropout=0.6, restrict_W=restrict_W)
+            self.conv2 = GATConv(self.hid * self.in_head, num_classes, edge_dim=edge_dim, concat=False,
                                    heads=self.out_head, dropout=0.6)
         else:
-            self.conv1 = MyGATConv(num_features, self.hid, heads=self.in_head, dropout=0.6)
-            self.conv2 = MyGATConv(self.hid * self.in_head, num_classes, concat=False, heads=self.out_head, dropout=0.6)
+            self.conv1 = GAT_ATTLOC_CONV(num_features, self.hid, v_mapping=v_mapping, heads=self.in_head, dropout=0.6, restrict_W=restrict_W)
+            self.conv2 = GATConv(self.hid * self.in_head, num_classes, concat=False, heads=self.out_head, dropout=0.6)
 
     def forward(self, data):
         x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
@@ -193,8 +204,14 @@ class MyGAT(torch.nn.Module):
 
         return F.log_softmax(x, dim=1)
 
+    def get_att_vectors(self):
+        return self.conv1.get_att_vectors()
+
 
 class GATConv(MessagePassing):
+    """
+    Similar to PYG GATConv.
+    """
     _alpha: OptTensor
 
     def __init__(
@@ -205,7 +222,7 @@ class GATConv(MessagePassing):
             concat: bool = True,
             negative_slope: float = 0.2,
             dropout: float = 0.0,
-            add_self_loops: bool = True,
+            add_self_loops: bool = False,
             edge_dim: Optional[int] = None,
             fill_value: Union[float, Tensor, str] = 'mean',
             bias: bool = True,
@@ -318,7 +335,7 @@ class GATConv(MessagePassing):
                         "'edge_index' in a 'SparseTensor' form")
 
         # propagate_type: (x: OptPairTensor, alpha: OptPairTensor, edge_attr: OptTensor)  # noqa
-        out = self.propagate(edge_index, x=x, alpha=alpha, edge_attr=edge_attr,
+        out = x_src + self.propagate(edge_index, x=x, alpha=alpha, edge_attr=edge_attr,
                              size=size)
 
         alpha = self._alpha
@@ -369,6 +386,9 @@ class GATConv(MessagePassing):
 
 
 class GAT(torch.nn.Module):
+    """
+    GAT network based on GATConv.
+    """
     def __init__(self, dataset, use_edge_attr=False):
         super(GAT, self).__init__()
         self.hid = 16
@@ -395,12 +415,15 @@ class GAT(torch.nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dataset):
+    """
+    MLP classifier on node classification.
+    """
+    def __init__(self, dataset, hidden_dim=None):
         super(MLP, self).__init__()
 
         self.input_dim = dataset[0].x.shape[1]
         self.output_dim = dataset.num_classes
-        self.hidden_dim = int(math.sqrt(self.input_dim * self.output_dim))
+        self.hidden_dim = int(math.sqrt(self.input_dim * self.output_dim)) if hidden_dim is None else hidden_dim
 
         self.lin1 = nn.Linear(self.input_dim, self.hidden_dim)
         self.lin2 = nn.Linear(self.hidden_dim, self.hidden_dim)
@@ -418,8 +441,55 @@ class MLP(nn.Module):
 
         return F.log_softmax(x, dim=1)
 
+    def encode(self, x):
+        x = self.lin1(x)
+        x = F.relu(x)
+        x = F.dropout(x, training=self.training)
+        x = self.lin2(x) + x
+        return x.detach().clone()
+
+    def train_model(self, data, train_mask, val_mask, num_epochs=200, use_early_stopping=False):
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.005, weight_decay=5e-4)
+        early_stopping = EarlyStopping(verbose=False, patience=50, activate=use_early_stopping)
+
+        for epoch in range(num_epochs):
+            self.train()
+            optimizer.zero_grad()
+            out = self(data)
+            loss = F.nll_loss(out[train_mask], data.y[train_mask])
+            loss.backward()
+            optimizer.step()
+
+            self.eval()
+            with torch.no_grad():
+                val_out = self(data)
+                val_loss = F.nll_loss(val_out[val_mask], data.y[val_mask])
+
+            early_stopping(val_loss.item(), self)
+
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+            if epoch % 40 == 0:
+                _, pred = out.max(dim=1)
+                correct = float(pred[train_mask].eq(data.y[train_mask]).sum().item())
+                acc = correct / train_mask.sum().item()
+                print(f"Train Accuracy: {acc:.4f}, Train loss: {loss.item():.4f}")
+
+                _, val_pred = val_out.max(dim=1)
+                val_correct = float(val_pred[val_mask].eq(data.y[val_mask]).sum().item())
+                val_acc = val_correct / val_mask.sum().item()
+                print(f"Validation Accuracy: {val_acc:.4f}, Validation loss: {val_loss.item():.4f}")
+
+        if use_early_stopping:
+            self.load_state_dict(torch.load('checkpoint.pt'))
+
 
 class AutoEncoder(nn.Module):
+    """
+    AutoEncoder used to compress feature vectors.
+    """
     def __init__(self, input_dim, output_dim):
         super(AutoEncoder, self).__init__()
 
@@ -450,6 +520,9 @@ class AutoEncoder(nn.Module):
 
 
 class weighted_MSELoss(_Loss):
+    """
+    A modified MSE loss that is weighted by feature length.
+    """
     def __init__(self, mappings, size_average=None, reduce=None, reduction: str = 'mean'):
         super(weighted_MSELoss, self).__init__(size_average, reduce, reduction)
         self.reduction = reduction
@@ -464,18 +537,20 @@ class weighted_MSELoss(_Loss):
             return torch.sum(sum) / input.shape[0]
 
 
-def dimension_reduction(tensor_data, output_dim, mappings=None, Epoch=2, Batch_size=64, LR=0.002, device='cpu'):
+def dimension_reduction(tensor_data, output_dim, train_mask, val_mask, mappings=None, Epoch=50, Batch_size=64, LR=0.002,
+                        device='cpu'):
+    """
+    Use autoencoder to compress the feature vector.
+    """
     data = tensor_data.to(device)
-    dataset = TensorDataset(data, data)
     [num_samples, input_dim] = tensor_data.shape
-    train_ratio = 0.8
-    num_train_samples = int(num_samples * train_ratio)
-    train_set, val_set = torch.utils.data.random_split(dataset, [num_train_samples, num_samples - num_train_samples])
+    train_set, val_set = TensorDataset(data[train_mask], data[train_mask]), TensorDataset(data[val_mask],
+                                                                                          data[val_mask])
     train_loader = DataLoader(train_set, batch_size=Batch_size, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=Batch_size, shuffle=True)
     ae = AutoEncoder(input_dim=input_dim, output_dim=output_dim).to(device)
 
-    print(ae)
+    # print(ae)
 
     optimizer = torch.optim.Adam(ae.parameters(), lr=LR)
 
@@ -484,6 +559,8 @@ def dimension_reduction(tensor_data, output_dim, mappings=None, Epoch=2, Batch_s
     else:
         mappings = mappings.to(device)
         loss_func = weighted_MSELoss(mappings, reduction='sum')
+
+    early_stopping = EarlyStopping(verbose=False, patience=7, activate=True)
 
     for epoch in range(Epoch):
         ae.train()
@@ -496,18 +573,25 @@ def dimension_reduction(tensor_data, output_dim, mappings=None, Epoch=2, Batch_s
             loss.backward()
             optimizer.step()
 
-        print('====> Epoch: {} Average train loss: {:.4f}'.format(
-            epoch, train_loss / len(train_loader.dataset)))
-
         ae.eval()
         val_loss = 0
         with torch.no_grad():
             for step, (x, _) in enumerate(val_loader):
                 reconstructed = ae(x)
                 val_loss += loss_func(reconstructed, x).item()
+        if epoch % 10 == 0:
+            print('====> Epoch: {} Average train loss: {:.4f}'.format(
+                epoch, train_loss / len(train_loader.dataset)))
+            print('====> Epoch: {} Average validation loss: {:.4f}'.format(
+                epoch, val_loss / len(val_loader.dataset)))
 
-        print('====> Epoch: {} Average validation loss: {:.4f}'.format(
-            epoch, val_loss / len(val_loader.dataset)))
+        early_stopping(val_loss / len(val_loader.dataset), ae)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
+
+    if early_stopping.activate:
+        ae.load_state_dict(torch.load('checkpoint.pt'))
 
     print('AutoEncoder training complele.')
     with torch.no_grad():
@@ -518,42 +602,3 @@ def dimension_reduction(tensor_data, output_dim, mappings=None, Epoch=2, Batch_s
         else:
             return encoded_data
 
-
-def train():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'training on device {device}.')
-
-    dataset = LPGdataset('./recommendation')
-    mappings = dataset.get_mappings()
-    encoded_x, encoded_v_mapping = dimension_reduction(dataset[0].x, output_dim=96, mappings=mappings[0], device=device)
-    encoded_e, encoded_e_mapping = dimension_reduction(dataset[0].edge_attr, output_dim=32, mappings=mappings[1],
-                                                       device=device)
-    data = dataset[0].to(device=device)
-    data.x, data.edge_attr = encoded_x, encoded_e
-    # model = MyGAT(data, use_edge_features=True, encoded_mappings=[encoded_v_mapping, encoded_e_mapping]).to(device)
-    model = MyGAT(data, use_edge_features=True).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
-
-    model.train()
-    for epoch in range(2000):
-        model.train()
-        optimizer.zero_grad()
-        out = model(data)
-        loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])
-
-        if epoch % 50 == 0:
-            print(loss)
-
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    _, pred = model(data).max(dim=1)
-    correct = float(pred[data.test_mask].eq(data.y[data.test_mask]).sum().item())
-    acc = correct / data.test_mask.sum().item()
-    print('Accuracy: {:.4f}'.format(acc))
-
-
-if __name__ == '__main__':
-    train()

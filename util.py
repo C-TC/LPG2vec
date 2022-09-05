@@ -1,8 +1,10 @@
+import torch_geometric.data.data
+
 from feature_encoders import *
 import os
 import torch
 import pandas as pd
-
+from torch_geometric.data import Data
 
 def encoding(data, col_info):
     tmp_data = data[col_info.keys()]
@@ -28,7 +30,6 @@ def encoding(data, col_info):
         elif col_info[col] == ColType.NUMBER_TO_BIN:
             encoder = BinEncoder()
         elif col_info[col] == ColType.STRING:
-            # continue
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
             encoder = StringEncoder(device=device)
             feature_str = encoder(tmp_data[col])
@@ -63,11 +64,6 @@ def generate_feature_vector(filename):
         v_columns_info = {"_id": ColType.INDEX, "_labels": ColType.CATEGORY, "abstract": ColType.STRING,
                           "n_citation": ColType.CLASSIFICATION_TARGET, "title": ColType.STRING,
                           "year": ColType.NUMBER_TO_BIN}
-        e_columns_info = {"_type": ColType.CATEGORY}
-    elif os.path.basename(filename) == 'twitter.csv':  # broken file
-        v_columns_info = {"_id": ColType.INDEX, "_labels": ColType.CATEGORY, "favorites": ColType.NUMBER_TO_BIN,
-                          "followers": ColType.CLASSIFICATION_TARGET,
-                          "name": ColType.STRING, "text": ColType.STRING}
         e_columns_info = {"_type": ColType.CATEGORY}
     elif os.path.basename(filename) == 'fraud-detection.csv':
         v_columns_info = {"_id": ColType.INDEX, "_labels": ColType.CATEGORY, "amount": ColType.CLASSIFICATION_TARGET,
@@ -114,21 +110,54 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def generate_raw_data(filename):
-    dataset_path = os.path.join('datasets', filename + '.csv')
-    e_index, v_feat, e_feat, target = generate_feature_vector(dataset_path)
-    root = os.path.join('.', filename, 'raw')
-    os.makedirs(root, exist_ok=True)
-    torch.save(e_index, os.path.join(root, 'edge_index.pt'))
-    torch.save(v_feat, os.path.join(root, 'vertex_features.pt'))
-    torch.save(e_feat, os.path.join(root, 'edge_features.pt'))
-    torch.save(target, os.path.join(root, 'target.pt'))
+def generate_raw_data(filename, data_loadpath='./raw_data', dataset_savepath='./datasets'):
+    data_path = os.path.join(data_loadpath, filename + '.csv')
+    e_index, v_feat, e_feat, target = generate_feature_vector(data_path)
+    dataset_path = os.path.join(dataset_savepath, filename, 'raw')
+    os.makedirs(dataset_path, exist_ok=True)
+    torch.save(e_index, os.path.join(dataset_path, 'edge_index.pt'))
+    torch.save(v_feat, os.path.join(dataset_path, 'vertex_features.pt'))
+    torch.save(e_feat, os.path.join(dataset_path, 'edge_features.pt'))
+    torch.save(target, os.path.join(dataset_path, 'target.pt'))
 
-    train_mask, test_mask = train_test_split(target.shape[0], 0.7)
-    torch.save(train_mask, os.path.join(root, 'train_mask.pt'))
-    torch.save(test_mask, os.path.join(root, 'test_mask.pt'))
+    # train_mask, test_mask = train_test_split(target.shape[0], 0.7)
+    # torch.save(train_mask, os.path.join(root, 'train_mask.pt'))
+    # torch.save(test_mask, os.path.join(root, 'test_mask.pt'))
 
+
+def preprocess_LPG_data(datasets_list=None):
+    if datasets_list is None:
+        datasets_list = ["recommendation", "citations", "fraud-detection", "fincen"]
+
+    for dataset_name in datasets_list:
+        generate_raw_data(dataset_name)
+
+
+def make_inductive_training_data(data: torch_geometric.data.data.Data, train_mask):
+    """
+    remove edges related to validation and test vertices. only edge_index and edge_attr are new, others are shallow copy.
+    """
+
+    def isin(ar1, ar2):
+        return (ar1[..., None] == torch.squeeze(ar2)).any(-1)
+
+    def make_inductive_edge_index_attr(edge_index: torch.Tensor, edge_attr, train_mask):
+        index_list = edge_index.clone().detach()
+        index_to_remove = torch.nonzero(~train_mask)
+
+        attr = edge_attr.clone().detach()
+
+        from_mask = isin(index_list[0, :], index_to_remove)
+        to_mask = isin(index_list[1, :], index_to_remove)
+
+        index_list = index_list[:, ~(from_mask | to_mask)]
+        attr = attr[~(from_mask | to_mask), :]
+
+        return index_list, attr
+
+    new_edge_index, new_edge_attr = make_inductive_edge_index_attr(data.edge_index, data.edge_attr, train_mask)
+    train_data = Data(x=data.x, edge_index=new_edge_index, y=data.y, edge_attr=new_edge_attr, train_mask=data.train_mask, test_mask=data.test_mask)
+    return train_data
 
 if __name__ == '__main__':
-    # e_index, v_feat, e_feat, target = generate_feature_vector('datasets/fincen.csv')
-    generate_raw_data('fraud-detection')
+    preprocess_LPG_data()

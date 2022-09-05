@@ -5,7 +5,7 @@ import torch
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
 
-    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
+    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print, activate=True):
         """
         Args:
             patience (int): How long to wait after last time validation loss improved.
@@ -28,8 +28,11 @@ class EarlyStopping:
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
+        self.activate = activate
 
     def __call__(self, val_loss, model):
+        if not self.activate:
+            return
 
         score = -val_loss
 
@@ -47,6 +50,8 @@ class EarlyStopping:
             self.counter = 0
 
     def save_checkpoint(self, val_loss, model):
+        if not self.activate:
+            return
         '''Saves model when validation loss decrease.'''
         if self.verbose:
             self.trace_func(
